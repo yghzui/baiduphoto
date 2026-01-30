@@ -103,6 +103,10 @@ class Requests:
         data = self.get(url, **kwargs).json()
         if data["errno"] == 0:
             return data
+        elif data["errno"] == 50000:
+            # 50000 usually means "File already exists" or similar non-critical state
+            logging.debug("request return (expected) non-zero errno, return = {}".format(data))
+            return data
         else:
             logging.error("request return error, return = {}".format(data))
             return data
@@ -111,6 +115,10 @@ class Requests:
     def postReqJson(self, url, **kwargs):
         data = self.post(url, **kwargs).json()
         if data["errno"] == 0:
+            return data
+        elif data["errno"] == 50000:
+            # 50000 usually means "File already exists" or similar non-critical state
+            logging.debug("request return (expected) non-zero errno, return = {}".format(data))
             return data
         else:
             logging.error("request return error, return = {}".format(data))

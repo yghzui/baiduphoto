@@ -163,10 +163,14 @@ class API:
             info = reqJson2["data"]
             if "fsid" not in info:
                 info["fsid"] = info["fs_id"]
-            return OnlineItem(info, self.req)
+            item = OnlineItem(info, self.req)
+            item.is_existing = False
+            return item
         elif preC["return_type"] == 3:  # already exist
             logging.warning("upload item already exist on remote")
-            return self.getOnlineItem_ByInfo(info=preC["data"])
+            item = self.getOnlineItem_ByInfo(info=preC["data"])
+            item.is_existing = True
+            return item
         else:
             logging.error(
                 "unknow return_type ={} @upload_1file_directly".format(
@@ -185,7 +189,8 @@ class API:
                     item.info, album.info
                 )
             )
-            album.append(item)
+            res = album.append(item)
+            item.append_result = res
         return item
 
     def createNewAlbum(self, Name, tid=None):
