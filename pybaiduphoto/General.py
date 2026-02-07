@@ -1,6 +1,7 @@
 from __future__ import annotations
 import os
 import io
+import json
 import random
 import logging
 import hashlib
@@ -74,17 +75,62 @@ class General:
             "media_info": muyangren907_shoot_time.getMediaInfo_interface(filePath),
         }
 
+    @staticmethod
+    def get_file_info_sliced(filePath, block_size=4 * 1024 * 1024):
+        size = os.path.getsize(filePath)
+        fileName = os.path.basename(filePath)
+        
+        md5_obj = hashlib.md5()
+        block_list = []
+        
+        with open(filePath, "rb") as f:
+            # Slice MD5: first 256KB
+            slice_data = f.read(256 * 1024)
+            slice_md5 = hashlib.md5(slice_data).hexdigest()
+            f.seek(0)
+            
+            while True:
+                chunk = f.read(block_size)
+                if not chunk:
+                    break
+                md5_obj.update(chunk)
+                block_list.append(hashlib.md5(chunk).hexdigest())
+                
+        content_md5 = md5_obj.hexdigest()
+        
+        return {
+            "fileName": fileName,
+            "localFilePath": filePath,
+            "size": size,
+            "ctime": int(os.path.getctime(filePath)),
+            "mtime": int(os.path.getmtime(filePath)),
+            "md5": content_md5, 
+            "slice-md5": slice_md5,
+            "content-md5": content_md5,
+            "block_list": block_list,
+            "media_info": muyangren907_shoot_time.getMediaInfo_interface(filePath),
+        }
+
     def upload_step1_preCreate(self, fileFull):
+        # Handle block_list
+        if "block_list" in fileFull and isinstance(fileFull["block_list"], list):
+            block_list_str = json.dumps(fileFull["block_list"])
+        else:
+            block_list_str = '["{}"]'.format(fileFull["md5"])
+
+        # Handle slice-md5
+        slice_md5 = fileFull.get("slice-md5", fileFull["md5"])
+
         postdata = {
             "autoinit": "1",
-            "block_list": '["{}"]'.format(fileFull["md5"]),
+            "block_list": block_list_str,
             "isdir": "0",
             "rtype": "1",
             "ctype": "11",  # required
             "path": "/" + fileFull["fileName"],  # required
             "size": fileFull["size"],  # required
             #   'slice-md5': '4fe8d73cf1ee838b...',
-            "slice-md5": fileFull["md5"],
+            "slice-md5": slice_md5,
             "content-md5": fileFull["md5"],  # required
             "local_ctime": fileFull["ctime"],
             "local_mtime": fileFull["mtime"],
@@ -131,7 +177,34 @@ class General:
         )
         return response.json()
 
+    def upload_step2_superfile2_chunk(self, uploadid, partseq, chunk_data, fileName):
+        params = dict(
+            (
+                ("method", "upload"),
+                ("app_id", "16051585"),
+                ("channel", "chunlei"),
+                ("clienttype", "70"),
+                ("web", "1"),
+                ("path", "/" + fileName),
+                ("uploadid", uploadid),
+                ("partseq", str(partseq)),
+            )
+        )
+        # logging.debug("upload_chunk seq={}, size={}".format(partseq, len(chunk_data)))
+        response = self.req.post(
+            "https://c3.pcs.baidu.com/rest/2.0/pcs/superfile2",
+            params=params,
+            files={fileName: io.BytesIO(chunk_data)},
+        )
+        return response.json()
+
     def upload_step3_create(self, preCreateInfo, fileFull):
+        # Handle block_list
+        if "block_list" in fileFull and isinstance(fileFull["block_list"], list):
+            block_list_str = json.dumps(fileFull["block_list"])
+        else:
+            block_list_str = '["{}"]'.format(fileFull["md5"])
+
         params = dict(
             (
                 ("clienttype", "70"),
@@ -143,7 +216,7 @@ class General:
             "path": "/" + fileFull["fileName"],
             "size": fileFull["size"],
             "uploadid": preCreateInfo["uploadid"],
-            "block_list": '["{}"]'.format(fileFull["md5"]),
+            "block_list": block_list_str,
             "isdir": "0",
             "rtype": "1",
             "content-md5": fileFull["md5"],
@@ -156,17 +229,39 @@ class General:
             "https://photo.baidu.com/youai/file/v1/create", params=params, data=data
         ).json()
 
-    def upload_1file(self, filePath):
-        # get_file_fullContent,fileName,localFilePath,size,ctime,mtime,md5,bin
-        fobj = self.get_file_fullContent(filePath)
+    def upload_1file(self, filePath, progress_callback=None, block_size=4 * 1024 * 1024):
+        # Use sliced info to support large files
+        fobj = self.get_file_info_sliced(filePath, block_size=block_size)
+        
         preC = self.upload_step1_preCreate(fobj)
         if preC.get("uploadid", None) is not None:
-            reqJson1 = self.upload_step2_superfile2(preCreateInfo=preC, fileFull=fobj)
+            # New Upload Logic with Chunks
+            uploadid = preC["uploadid"]
+            
+            with open(filePath, "rb") as f:
+                partseq = 0
+                uploaded_size = 0
+                while True:
+                    chunk = f.read(block_size)
+                    if not chunk:
+                        break
+                    
+                    self.upload_step2_superfile2_chunk(uploadid, partseq, chunk, fobj["fileName"])
+                    uploaded_size += len(chunk)
+                    
+                    if progress_callback:
+                        progress_callback(uploaded_size, fobj["size"])
+                        
+                    partseq += 1
+            
+            # After all chunks, call create
             reqJson2 = self.upload_step3_create(preCreateInfo=preC, fileFull=fobj)
-            return preC, reqJson1, reqJson2
+            return preC, {}, reqJson2 # reqJson1 is empty as we had multiple calls
         else:
             pass
-            # file exsis online, 確認網頁操作時也沒有重新上傳
+            # file exsis online
+            if progress_callback:
+                progress_callback(fobj["size"], fobj["size"])
             return preC, None, None
 
     def createNewAlbum(self, Name, tid=None):

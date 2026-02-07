@@ -151,8 +151,8 @@ class API:
             else:
                 return r
 
-    def upload_1file_directly(self, filePath):
-        preC, reqJson1, reqJson2 = self.g.upload_1file(filePath)
+    def upload_1file_directly(self, filePath, progress_callback=None, block_size=4 * 1024 * 1024):
+        preC, reqJson1, reqJson2 = self.g.upload_1file(filePath, progress_callback=progress_callback, block_size=block_size)
         logging.debug(
             "upload file: preC=\n{}\n,reqJson1=\n{}\n, reqJson2=\n{}\n ".format(
                 preC, reqJson1, reqJson2
@@ -180,9 +180,9 @@ class API:
             logging.error("full response = [{}]".format(str(preC)))
             return
 
-    def upload_1file(self, filePath, album=None):
+    def upload_1file(self, filePath, album=None, progress_callback=None, block_size=4 * 1024 * 1024):
         # consider upload into alumb
-        item = self.upload_1file_directly(filePath=filePath)
+        item = self.upload_1file_directly(filePath=filePath, progress_callback=progress_callback, block_size=block_size)
         if album is not None and item is not None:
             logging.debug(
                 "append item into album. item=[{}],album=[{}]".format(
