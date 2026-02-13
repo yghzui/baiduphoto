@@ -4,6 +4,9 @@ import sys
 import argparse
 import shutil
 import time
+import threading
+import queue
+from concurrent.futures import ThreadPoolExecutor
 
 # Add current directory to path
 sys.path.append(os.getcwd())
@@ -12,6 +15,44 @@ from pybaiduphoto import API
 from generate_upload_info import generate_upload_info
 
 HISTORY_FILE = 'local_upload_history.json'
+
+class MultiLinePrinter:
+    def __init__(self, num_lines):
+        self.num_lines = num_lines
+        self.lines = ["Waiting..."] * num_lines
+        self.lock = threading.Lock()
+        # Reserve space
+        sys.stdout.write("\n" * num_lines)
+        self._move_up(num_lines)
+
+    def _move_up(self, n):
+        if n > 0:
+            sys.stdout.write(f"\033[{n}A")
+
+    def update(self, slot_id, text):
+        with self.lock:
+            if 0 <= slot_id < self.num_lines:
+                self.lines[slot_id] = text
+                self._redraw()
+
+    def log(self, text):
+        with self.lock:
+            # Move cursor to start of progress block
+            self._move_up(self.num_lines)
+            # Clear everything below
+            sys.stdout.write("\033[J")
+            # Print log
+            sys.stdout.write(f"{text}\n")
+            # Print progress lines again
+            for line in self.lines:
+                sys.stdout.write(f"{line}\033[K\n")
+            sys.stdout.flush()
+
+    def _redraw(self):
+        self._move_up(self.num_lines)
+        for line in self.lines:
+            sys.stdout.write(f"{line}\033[K\n")
+        sys.stdout.flush()
 
 def load_history():
     if os.path.exists(HISTORY_FILE):
@@ -37,9 +78,14 @@ def clean_filename(text):
     """
     return "".join(c for c in text if c <= "\uFFFF")
 
-def upload_task(user_id_or_name, max_retries=3, local_check=False):
+def upload_task(user_id_or_name, max_retries=3, local_check=False, block_size_mb=4, num_threads=1):
     print(f"--- Starting upload task for: {user_id_or_name} ---")
     
+    # Calculate block size in bytes
+    block_size = int(block_size_mb * 1024 * 1024)
+    print(f"Upload block size: {block_size_mb} MB ({block_size} bytes)")
+    print(f"Number of threads: {num_threads}")
+
     # 1. Get info
     album_name, upload_dir = generate_upload_info(user_id_or_name)
     if not album_name or not upload_dir:
@@ -60,9 +106,9 @@ def upload_task(user_id_or_name, max_retries=3, local_check=False):
         raw_list = full_history.get(album_name, [])
         # Convert to dict for fast lookup (using dict as ordered set)
         if isinstance(raw_list, list):
-             album_history = {name: True for name in raw_list}
+            album_history = {name: True for name in raw_list}
         else:
-             album_history = raw_list # Assume it's a dict if not list
+            album_history = raw_list # Assume it's a dict if not list
 
     # 2. Login
     cookie_path = os.path.join(os.getcwd(), 'cookies.json')
@@ -99,11 +145,6 @@ def upload_task(user_id_or_name, max_retries=3, local_check=False):
         return
 
     # 4. Get existing files in album for de-duplication
-    # Even if local_check is True, we should probably still fetch cloud state 
-    # unless we are strictly relying on local. But the requirement says 
-    # "if enabled, local check then skip directly". 
-    # We still fetch existing_names to update our local history if needed and to skip duplicates 
-    # that are in cloud but not in local history.
     print("Fetching existing files in album to skip duplicates...")
     existing_names = set()
     try:
@@ -113,10 +154,6 @@ def upload_task(user_id_or_name, max_retries=3, local_check=False):
             for item in existing_items:
                 existing_names.add(item.getName())
         print(f"Found {len(existing_names)} existing files in album.")
-        
-        # Sync cloud existing to local history if not present?
-        # User requirement: "Must be confirmed uploaded". 
-        # Cloud existing means it IS uploaded. So we can implicitly trust it.
     except Exception as e:
         print(f"Error fetching album content: {e}")
         return
@@ -138,12 +175,26 @@ def upload_task(user_id_or_name, max_retries=3, local_check=False):
             
             file_tasks.append((root, file))
 
+    # Sort files by size (ascending) - upload small files first
+    print("Sorting files by size (small to large)...")
+    file_tasks.sort(key=lambda x: os.path.getsize(os.path.join(x[0], x[1])))
+
     total_files = len(file_tasks)
     print(f"Total files to process: {total_files}")
 
     upload_count = 0
     skip_count = 0
     fail_count = 0
+    processed_count = 0
+    lock = threading.Lock()
+
+    # Initialize MultiLinePrinter
+    printer = MultiLinePrinter(num_threads)
+    
+    # Slot Queue for managing display lines
+    slot_queue = queue.Queue()
+    for i in range(num_threads):
+        slot_queue.put(i)
 
     # Helper to save history
     def save_progress():
@@ -154,126 +205,211 @@ def upload_task(user_id_or_name, max_retries=3, local_check=False):
                 current_full[album_name] = list(album_history.keys())
                 save_history(current_full)
             except Exception as e:
-                print(f"Warning: Failed to save history: {e}")
+                printer.log(f"Warning: Failed to save history: {e}")
+
+    # Worker Function
+    def process_file(task_item):
+        nonlocal upload_count, skip_count, fail_count, processed_count
+        idx, root, file = task_item
+        
+        # Get a display slot
+        slot_id = slot_queue.get()
+        task_start_time = time.time()
+        
+        try:
+            # Calculate progress safely
+            with lock:
+                processed_count += 1
+                current_progress = processed_count
+            
+            file_path = os.path.join(root, file)
+
+            # Helper to format elapsed time
+            def get_elapsed_str():
+                elapsed = int(time.time() - task_start_time)
+                hours, remainder = divmod(elapsed, 3600)
+                minutes, seconds = divmod(remainder, 60)
+                return f"{hours:02}:{minutes:02}:{seconds:02}"
+
+            # Clean filename to handle emojis (filter out non-BMP characters)
+            cleaned_name = clean_filename(file)
+            
+            # --- Check 1: Local History (if enabled) ---
+            should_skip = False
+            with lock:
+                 if local_check and cleaned_name in album_history:
+                     should_skip = True
+            
+            if should_skip:
+                 with lock:
+                     skip_count += 1
+                 printer.update(slot_id, f"[ID:{slot_id}] [{current_progress}/{total_files}] [Skip-Local] {file}")
+                 time.sleep(0.1)
+                 return
+
+            # --- Check 2: Cloud Existing ---
+            should_skip_cloud = False
+            with lock:
+                if cleaned_name in existing_names:
+                    should_skip_cloud = True
+            
+            if should_skip_cloud:
+                with lock:
+                    if local_check and cleaned_name not in album_history:
+                         album_history[cleaned_name] = True
+                    skip_count += 1
+                printer.update(slot_id, f"[ID:{slot_id}] [{current_progress}/{total_files}] [Skip-Cloud] {file}")
+                time.sleep(0.1)
+                return
+            
+            printer.update(slot_id, f"[ID:{slot_id}] [{current_progress}/{total_files}] [Start] {file}")
+            
+            # Prepare for upload (renaming logic)
+            upload_path = file_path
+            temp_path = None
+            
+            # If filename needs cleaning (contains emojis/special chars)
+            if file != cleaned_name:
+                printer.log(f"  -> Cleaning filename: {file} -> {cleaned_name}")
+                
+                # Check for local collision
+                candidate_path = os.path.join(root, cleaned_name)
+                if os.path.exists(candidate_path):
+                    root_name, ext = os.path.splitext(cleaned_name)
+                    cleaned_name_safe = f"{root_name}_safe{ext}"
+                    candidate_path = os.path.join(root, cleaned_name_safe)
+                    printer.log(f"  -> Collision detected. Trying: {cleaned_name_safe}")
+                    
+                    if os.path.exists(candidate_path):
+                        with lock:
+                            fail_count += 1
+                        printer.log(f"  -> Error: Safe filename also exists. Skipping {file}.")
+                        return
+                    cleaned_name = cleaned_name_safe
+
+                temp_path = candidate_path
+                try:
+                    try:
+                        os.link(file_path, temp_path)
+                    except OSError:
+                        shutil.copy2(file_path, temp_path)
+                    upload_path = temp_path
+                except Exception as e:
+                    with lock:
+                        fail_count += 1
+                    printer.log(f"  -> Error creating temp file: {e}")
+                    return
+
+            # Retry Loop
+            success = False
+            for attempt in range(max_retries):
+                if attempt > 0:
+                    printer.log(f"  -> Retry attempt {attempt+1}/{max_retries} for {file}...")
+                    time.sleep(2)
+                
+                # Progress Callback Factory
+                def create_progress_callback(filename, my_slot):
+                    start_time = time.time()
+                    last_print_time = 0
+                    
+                    def callback(uploaded_size, total_size):
+                        nonlocal last_print_time
+                        current_time = time.time()
+                        
+                        # Update every 0.5 second or if finished
+                        if current_time - last_print_time >= 0.5 or uploaded_size >= total_size:
+                            elapsed_seconds = current_time - start_time
+                            elapsed = int(elapsed_seconds)
+                            hours, remainder = divmod(elapsed, 3600)
+                            minutes, seconds = divmod(remainder, 60)
+                            time_str = f"{hours:02}:{minutes:02}:{seconds:02}"
+                            
+                            uploaded_mb = uploaded_size / (1024 * 1024)
+                            total_mb = total_size / (1024 * 1024)
+                            
+                            percent = (uploaded_size / total_size) * 100 if total_size > 0 else 0
+                            speed = uploaded_mb / elapsed_seconds if elapsed_seconds > 0.1 else 0
+                            
+                            # Calculate ETA
+                            remaining_mb = total_mb - uploaded_mb
+                            if speed > 0:
+                                eta_seconds = int(remaining_mb / speed)
+                                eta_h, eta_r = divmod(eta_seconds, 3600)
+                                eta_m, eta_s = divmod(eta_r, 60)
+                                eta_str = f"{eta_h:02}:{eta_m:02}:{eta_s:02}"
+                            else:
+                                eta_str = "--:--:--"
+
+                            # [ID:X] [N/Total] [Upload] 12.5/100.0(MB) 12.5% 耗时00:00:12 1.50MB/s 剩余00:00:05 filename
+                            msg = f"[ID:{my_slot}] [{current_progress}/{total_files}] [Upload] {uploaded_mb:.2f}/{total_mb:.2f}(MB) {percent:.1f}% 耗时{time_str} {speed:.2f}MB/s 剩余{eta_str} {filename}"
+                            printer.update(my_slot, msg)
+                                
+                            last_print_time = current_time
+                    return callback
+                
+                progress_cb = create_progress_callback(file, slot_id)
+
+                try:
+                    # upload_1file handles uploading and appending to album
+                    # Updated to support block_size and progress_callback
+                    ret = api.upload_1file(filePath=upload_path, album=target_album, progress_callback=progress_cb, block_size=block_size)
+                    
+                    if ret:
+                        is_existing = getattr(ret, 'is_existing', False)
+                        with lock:
+                            if is_existing:
+                                pass # Keep log quiet
+                            
+                            append_res = getattr(ret, 'append_result', None)
+                            
+                            existing_names.add(cleaned_name) 
+                            if local_check:
+                                album_history[cleaned_name] = True
+                            
+                            upload_count += 1
+                        
+                        success = True
+                        printer.log(f"[{current_progress}/{total_files}] [Success] 耗时:{get_elapsed_str()} {file}")
+                        break
+                    else:
+                        printer.log(f"[{current_progress}/{total_files}] [Failed] {file} (API returned None)")
+                except Exception as e:
+                    printer.log(f"[{current_progress}/{total_files}] [Error] {file}: {e}")
+
+            if not success:
+                with lock:
+                    fail_count += 1
+                printer.log(f"[{current_progress}/{total_files}] [Failed] All {max_retries} attempts failed for {file}")
+
+            # Cleanup temp file
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError as e:
+                    printer.log(f"  -> Warning: Failed to remove temp file {temp_path}: {e}")
+
+            # Periodic Save
+            with lock:
+                if processed_count % 20 == 0:
+                    save_progress()
+                    printer.log(f"  -> [System] Periodic history save ({processed_count}/{total_files})")
+        
+        finally:
+            slot_queue.put(slot_id)
 
     # 6. Process files
-    for idx, (root, file) in enumerate(file_tasks):
-        current_progress = idx + 1
-        print(f"\nProgress [{current_progress}/{total_files}] | Success: {upload_count} | Skipped: {skip_count} | Failed: {fail_count}")
-        
-        file_path = os.path.join(root, file)
-        
-        # Clean filename to handle emojis (filter out non-BMP characters)
-        cleaned_name = clean_filename(file)
-        
-        # --- Check 1: Local History (if enabled) ---
-        if local_check and cleaned_name in album_history:
-             print(f"[Skip-Local] {file} (Found in local history)")
-             skip_count += 1
-             continue
-
-        # --- Check 2: Cloud Existing ---
-        if cleaned_name in existing_names:
-            print(f"[Skip-Cloud] {file} (Already exists as {cleaned_name})")
-            # If in cloud but not in local history, should we add it?
-            # User said "Add uploaded file record". If we confirm it's in cloud, we can record it.
-            if local_check and cleaned_name not in album_history:
-                 album_history[cleaned_name] = True
-            skip_count += 1
-            continue
-        
-        print(f"[Upload] {file} ...")
-        
-        # Prepare for upload (renaming logic)
-        upload_path = file_path
-        temp_path = None
-        
-        # If filename needs cleaning (contains emojis/special chars)
-        if file != cleaned_name:
-            print(f"  -> Cleaning filename: {file} -> {cleaned_name}")
-            
-            # Check for local collision (if the cleaned filename already exists locally)
-            candidate_path = os.path.join(root, cleaned_name)
-            if os.path.exists(candidate_path):
-                # Collision detected, try to append safe suffix
-                root_name, ext = os.path.splitext(cleaned_name)
-                cleaned_name_safe = f"{root_name}_safe{ext}"
-                candidate_path = os.path.join(root, cleaned_name_safe)
-                print(f"  -> Collision detected. Trying: {cleaned_name_safe}")
-                
-                if os.path.exists(candidate_path):
-                    print(f"  -> Error: Safe filename also exists. Skipping.")
-                    fail_count += 1
-                    continue
-                cleaned_name = cleaned_name_safe
-
-            temp_path = candidate_path
-            try:
-                # Try hardlink first (fast, no space used), then copy
-                try:
-                    os.link(file_path, temp_path)
-                except OSError:
-                    shutil.copy2(file_path, temp_path)
-                upload_path = temp_path
-            except Exception as e:
-                print(f"  -> Error creating temp file: {e}")
-                fail_count += 1
-                continue
-
-        # Retry Loop
-        success = False
-        for attempt in range(max_retries):
-            if attempt > 0:
-                print(f"  -> Retry attempt {attempt+1}/{max_retries}...")
-                time.sleep(2) # Wait a bit before retry
-            
-            try:
-                # upload_1file handles uploading and appending to album
-                ret = api.upload_1file(filePath=upload_path, album=target_album)
-                if ret:
-                    if getattr(ret, 'is_existing', False):
-                        print(f"  -> [Cloud Match] File exists in cloud (fs_id={ret.get_fsid()}).")
-                        # Check append result
-                        append_res = getattr(ret, 'append_result', None)
-                        if append_res and append_res.get('errno') in [0, 50000]: # 0=success, 50000=already in album
-                            print(f"  -> [Album] Verified in/added to album.")
-                        else:
-                            print(f"  -> [Album] Warning: Status unknown. Result: {append_res}")
-                    else:
-                        print(f"  -> [Upload] Success (New file).")
-                    
-                    # Update States
-                    existing_names.add(cleaned_name) 
-                    if local_check:
-                        album_history[cleaned_name] = True
-                    
-                    upload_count += 1
-                    success = True
-                    break # Break retry loop
-                else:
-                    print(f"  -> Failed (API returned None)")
-                    # Don't break, retry
-            except Exception as e:
-                print(f"  -> Error: {e}")
-                # Don't break, retry
-
-        if not success:
-            print(f"  -> All {max_retries} attempts failed for {file}")
-            fail_count += 1
-
-        # Cleanup temp file if created
-        if temp_path and os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except OSError as e:
-                print(f"  -> Warning: Failed to remove temp file {temp_path}: {e}")
-
-        # Periodic Save
-        if (idx + 1) % 20 == 0:
-            save_progress()
-            print(f"  -> [System] Periodic history save ({idx+1}/{total_files})")
-    
-    # End of loop
+    if num_threads <= 1:
+        # Single Thread Mode
+        for idx, (root, file) in enumerate(file_tasks):
+            process_file((idx, root, file))
+    else:
+        # Multi-Thread Mode
+        print(f"Starting execution with {num_threads} threads...")
+        with ThreadPoolExecutor(max_workers=num_threads) as executor:
+            tasks = []
+            for idx, (root, file) in enumerate(file_tasks):
+                tasks.append((idx, root, file))
+            executor.map(process_file, tasks)
     
     # Final Save
     save_progress()
@@ -286,7 +422,6 @@ def upload_task(user_id_or_name, max_retries=3, local_check=False):
     print(f"Skipped:  {skip_count}")
     print(f"Failed:   {fail_count}")
     
-    # Validation
     if upload_count + skip_count + fail_count != total_files:
         print(f"Warning: Count mismatch! ({upload_count}+{skip_count}+{fail_count} != {total_files})")
     
@@ -298,8 +433,10 @@ def upload_task(user_id_or_name, max_retries=3, local_check=False):
         'failed': fail_count
     }
 
-def upload_album(user_id_or_name, max_retries=3, local_check=False):
-    # Check for 'all' command
+def upload_album(user_id_or_name, max_retries=3, local_check=False, block_size_mb=4, num_threads=1):
+    targets = []
+    
+    # 1. Determine targets
     if user_id_or_name == 'all':
         print("--- Batch Upload Mode: Processing ALL users from users.json ---")
         users_path = os.path.join(os.getcwd(), 'users.json')
@@ -308,76 +445,81 @@ def upload_album(user_id_or_name, max_retries=3, local_check=False):
                 with open(users_path, 'r', encoding='utf-8') as f:
                     users = json.load(f)
                 
-                total_users = len(users)
-                print(f"Found {total_users} users in users.json")
-                
-                summary_report = []
-
-                for i, user in enumerate(users):
-                    user_id = user.get('id')
+                print(f"Found {len(users)} users in users.json")
+                for user in users:
+                    u_id = user.get('id')
                     name = user.get('name')
-                    target = user_id if user_id else name
-                    
-                    if target:
-                        print(f"\n[{i+1}/{total_users}] Processing user: {name} (ID: {user_id})")
-                        stats = upload_task(target, max_retries, local_check)
-                        if stats:
-                            # If upload_task returns None (e.g. invalid user info), handle it
-                            # But current upload_task returns None on early exit. 
-                            # We need to ensure upload_task always returns a dict or handle None.
-                            # I will update upload_task to return None on early error, so we handle it here.
-                            stats['user_display'] = f"{name}({user_id})" if name and user_id else target
-                            summary_report.append(stats)
+                    t = u_id if u_id else name
+                    if t:
+                        targets.append({'target': t, 'display': f"{name}({u_id})" if name and u_id else t})
                     else:
-                        print(f"\n[{i+1}/{total_users}] Skipping invalid user entry: {user}")
-                
-                # Print Final Summary
-                print("\n" + "="*60)
-                print(f"{'FINAL BATCH UPLOAD SUMMARY':^60}")
-                print("="*60)
-                print(f"{'User':<25} | {'Total':<8} | {'Upload':<8} | {'Skip':<8} | {'Fail':<8}")
-                print("-" * 60)
-                
-                total_files_all = 0
-                total_uploaded_all = 0
-                total_skipped_all = 0
-                total_failed_all = 0
-
-                for s in summary_report:
-                    print(f"{s['user_display']:<25} | {s['total']:<8} | {s['uploaded']:<8} | {s['skipped']:<8} | {s['failed']:<8}")
-                    total_files_all += s['total']
-                    total_uploaded_all += s['uploaded']
-                    total_skipped_all += s['skipped']
-                    total_failed_all += s['failed']
-                
-                print("-" * 60)
-                print(f"{'TOTAL':<25} | {total_files_all:<8} | {total_uploaded_all:<8} | {total_skipped_all:<8} | {total_failed_all:<8}")
-                print("="*60)
-
+                        print(f"Skipping invalid user entry: {user}")
             except Exception as e:
                 print(f"Error reading users.json: {e}")
+                return
         else:
             print(f"Error: users.json not found at {users_path}")
+            return
+    elif ',' in user_id_or_name:
+        print(f"--- Batch Upload Mode: Processing specified list: {user_id_or_name} ---")
+        raw_list = [x.strip() for x in user_id_or_name.split(',') if x.strip()]
+        for t in raw_list:
+            targets.append({'target': t, 'display': t})
     else:
-        print(f"\n>>> Processing argument: {user_id_or_name}")
-        upload_task(user_id_or_name, max_retries, local_check)
+        # Single user
+        targets.append({'target': user_id_or_name, 'display': user_id_or_name})
+
+    # 2. Process Targets
+    summary_report = []
+    total_targets = len(targets)
+    
+    if total_targets == 0:
+        print("No targets to process.")
+        return
+
+    for i, item in enumerate(targets):
+        target = item['target']
+        display = item['display']
+        
+        print(f"\n[{i+1}/{total_targets}] Processing: {display}")
+        stats = upload_task(target, max_retries, local_check, block_size_mb, num_threads)
+        if stats:
+            stats['user_display'] = display
+            summary_report.append(stats)
+            
+    # 3. Final Summary (if more than 1 target or explicit batch mode)
+    if len(targets) > 1 or user_id_or_name == 'all':
+        print("\n" + "="*60)
+        print(f"{'FINAL BATCH UPLOAD SUMMARY':^60}")
+        print("="*60)
+        print(f"{'User':<25} | {'Total':<8} | {'Upload':<8} | {'Skip':<8} | {'Fail':<8}")
+        print("-" * 60)
+        
+        total_files_all = 0
+        total_uploaded_all = 0
+        total_skipped_all = 0
+        total_failed_all = 0
+
+        for s in summary_report:
+            print(f"{s['user_display']:<25} | {s['total']:<8} | {s['uploaded']:<8} | {s['skipped']:<8} | {s['failed']:<8}")
+            total_files_all += s['total']
+            total_uploaded_all += s['uploaded']
+            total_skipped_all += s['skipped']
+            total_failed_all += s['failed']
+        
+        print("-" * 60)
+        print(f"{'TOTAL':<25} | {total_files_all:<8} | {total_uploaded_all:<8} | {total_skipped_all:<8} | {total_failed_all:<8}")
+        print("="*60)
         
         
 if __name__ == '__main__':
-    id_or_name="all"
     parser = argparse.ArgumentParser(description="Upload images to a specified album.")
-    # Allow positional argument for backward compatibility and ease of use
-    parser.add_argument("user_input", nargs='?', default=None, help="User ID or Name to upload images for. Use 'all' to process all users in users.json.")
-    parser.add_argument("--user_id_or_name", default=id_or_name,type=str, help="User ID or Name (optional)")
+    parser.add_argument("--user_id_or_name", default="all", type=str, help="User ID or Name, or comma-separated list. Use 'all' for users.json. (default: all)")
     parser.add_argument("--retries", type=int, default=3, help="Max retries for failed uploads (default: 3)")
     parser.add_argument("--local_check", default=True, type=lambda x: (str(x).lower() == 'true'), help="Enable local history verification to skip uploaded files")
+    parser.add_argument("--block_size", type=float, default=4, help="Upload block size in MB (default: 4)")
+    parser.add_argument("--threads", type=int, default=1, help="Number of upload threads (default: 1)")
      
     args = parser.parse_args()
     
-    # Prioritize positional argument, then flag, then default to "all"
-    target = args.user_input if args.user_input else args.user_id_or_name
-    local_check = args.local_check if args.local_check is not None else False
-    if not target:
-        target = "all"
-        
-    upload_album(target, args.retries, local_check)
+    upload_album(args.user_id_or_name, args.retries, args.local_check, args.block_size, args.threads)
