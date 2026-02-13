@@ -13,8 +13,8 @@ sys.path.append(os.getcwd())
 
 from pybaiduphoto import API
 from generate_upload_info import generate_upload_info
-
-HISTORY_FILE = 'local_upload_history.json'
+current_dir = os.path.dirname(os.path.abspath(__file__))
+HISTORY_FILE = os.path.join(current_dir, 'local_upload_history.json')
 
 class MultiLinePrinter:
     def __init__(self, num_lines):
@@ -78,7 +78,7 @@ def clean_filename(text):
     """
     return "".join(c for c in text if c <= "\uFFFF")
 
-def upload_task(user_id_or_name, max_retries=3, local_check=False, block_size_mb=4, num_threads=1):
+def upload_task(user_id_or_name, max_retries=3, local_check=False, block_size_mb=4, num_threads=1, cookies_path=None, config_files=None):
     print(f"--- Starting upload task for: {user_id_or_name} ---")
     
     # Calculate block size in bytes
@@ -87,7 +87,7 @@ def upload_task(user_id_or_name, max_retries=3, local_check=False, block_size_mb
     print(f"Number of threads: {num_threads}")
 
     # 1. Get info
-    album_name, upload_dir = generate_upload_info(user_id_or_name)
+    album_name, upload_dir = generate_upload_info(user_id_or_name, config_files)
     if not album_name or not upload_dir:
         print("Failed to generate upload info. Please check if the user exists in users.json.")
         return
@@ -111,16 +111,18 @@ def upload_task(user_id_or_name, max_retries=3, local_check=False, block_size_mb
             album_history = raw_list # Assume it's a dict if not list
 
     # 2. Login
-    cookie_path = os.path.join(os.getcwd(), 'cookies.json')
-    if not os.path.exists(cookie_path):
-        print(f"Error: cookies.json not found at {cookie_path}")
+    if not cookies_path:
+         cookies_path = os.path.join(os.getcwd(), 'baiduphoto/cookies.json')
+         
+    if not os.path.exists(cookies_path):
+        print(f"Error: Cookies file not found at {cookies_path}")
         return
         
     try:
-        with open(cookie_path, 'r', encoding='utf-8') as f:
+        with open(cookies_path, 'r', encoding='utf-8') as f:
             cookies = json.load(f)
         api = API(cookies=cookies)
-        print("API initialized successfully.")
+        print(f"API initialized successfully with cookies from {cookies_path}")
     except Exception as e:
         print(f"Login failed: {e}")
         return
@@ -433,41 +435,91 @@ def upload_task(user_id_or_name, max_retries=3, local_check=False, block_size_mb
         'failed': fail_count
     }
 
-def upload_album(user_id_or_name, max_retries=3, local_check=False, block_size_mb=4, num_threads=1):
+def upload_album(user_id_or_name, max_retries=3, local_check=False, block_size_mb=4, num_threads=1, cookies_path=None, config_files=None):
     targets = []
     
     # 1. Determine targets
-    if user_id_or_name == 'all':
-        print("--- Batch Upload Mode: Processing ALL users from users.json ---")
-        users_path = os.path.join(os.getcwd(), 'users.json')
-        if os.path.exists(users_path):
+    # Config Paths
+    if config_files:
+        all_configs = [(path, f"Custom Config {i+1}") for i, path in enumerate(config_files)]
+    else:
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.dirname(current_dir)
+        douyin_config = os.path.join(project_root, 'video_download_video_image', 'config', 'users.json')
+        twitter_config = os.path.join(project_root, 'video_download_video_image', 'config', 'x_user.json')
+        all_configs = [
+            (douyin_config, "Douyin"),
+            (twitter_config, "Twitter")
+        ]
+
+    def load_users(path, label):
+        loaded_users = []
+        if os.path.exists(path):
             try:
-                with open(users_path, 'r', encoding='utf-8') as f:
-                    users = json.load(f)
-                
-                print(f"Found {len(users)} users in users.json")
-                for user in users:
-                    u_id = user.get('id')
-                    name = user.get('name')
-                    t = u_id if u_id else name
-                    if t:
-                        targets.append({'target': t, 'display': f"{name}({u_id})" if name and u_id else t})
-                    else:
-                        print(f"Skipping invalid user entry: {user}")
+                with open(path, 'r', encoding='utf-8') as f:
+                    loaded_users = json.load(f)
+                print(f"Loaded {len(loaded_users)} users from {label}")
             except Exception as e:
-                print(f"Error reading users.json: {e}")
-                return
+                print(f"Error reading {label} ({path}): {e}")
         else:
-            print(f"Error: users.json not found at {users_path}")
-            return
+            print(f"Config not found: {label} ({path})")
+        return loaded_users
+
+    def add_to_targets(user_list):
+        for user in user_list:
+            u_id = user.get('id')
+            name = user.get('name')
+            t = u_id if u_id else name
+            if t:
+                targets.append({'target': t, 'display': f"{name}({u_id})" if name and u_id else t})
+            else:
+                print(f"Skipping invalid user entry: {user}")
+
+    if user_id_or_name == 'all_twitter' and not config_files:
+        # Backward compatibility for specific 'all_twitter' flag without explicit configs
+        # Assuming if user passes config_files, they want 'all' to mean 'all in those files'
+        # But 'all_twitter' is specific to internal logic.
+        # If user provides custom configs, 'all_twitter' might be ambiguous unless they are twitter configs.
+        # For simplicity, if config_files is set, we treat 'all' or 'all_xxx' as loading all from those files.
+        # But let's keep the original specific flags if no custom config provided.
+        print("--- Batch Mode: Twitter Users ---")
+        add_to_targets(load_users(twitter_config, "Twitter Config"))
+    elif user_id_or_name == 'all_douyin' and not config_files:
+        print("--- Batch Mode: Douyin Users ---")
+        add_to_targets(load_users(douyin_config, "Douyin Config"))
+    elif user_id_or_name.startswith('all'):
+        # Handles 'all', 'all_douyin' (with custom files), 'all_twitter' (with custom files)
+        print("--- Batch Mode: All Users from Configs ---")
+        for path, label in all_configs:
+            add_to_targets(load_users(path, label))
     elif ',' in user_id_or_name:
         print(f"--- Batch Upload Mode: Processing specified list: {user_id_or_name} ---")
         raw_list = [x.strip() for x in user_id_or_name.split(',') if x.strip()]
         for t in raw_list:
             targets.append({'target': t, 'display': t})
     else:
-        # Single user
-        targets.append({'target': user_id_or_name, 'display': user_id_or_name})
+        # Single user - Search in configs first
+        found_in_config = False
+        
+        for cfg_path, cfg_name in all_configs:
+            if os.path.exists(cfg_path):
+                try:
+                    with open(cfg_path, 'r', encoding='utf-8') as f:
+                        users = json.load(f)
+                        for user in users:
+                            # Check ID or Name
+                            if str(user.get('id')) == str(user_id_or_name) or user.get('name') == user_id_or_name:
+                                u_id = user.get('id')
+                                name = user.get('name')
+                                t = u_id if u_id else name
+                                targets.append({'target': t, 'display': f"{name}({u_id})" if name and u_id else t})
+                                found_in_config = True
+                except Exception:
+                    pass
+        
+        if not found_in_config:
+            # Fallback to direct usage if not found in any config
+            targets.append({'target': user_id_or_name, 'display': user_id_or_name})
 
     # 2. Process Targets
     summary_report = []
@@ -482,13 +534,13 @@ def upload_album(user_id_or_name, max_retries=3, local_check=False, block_size_m
         display = item['display']
         
         print(f"\n[{i+1}/{total_targets}] Processing: {display}")
-        stats = upload_task(target, max_retries, local_check, block_size_mb, num_threads)
+        stats = upload_task(target, max_retries, local_check, block_size_mb, num_threads, cookies_path, config_files)
         if stats:
             stats['user_display'] = display
             summary_report.append(stats)
             
     # 3. Final Summary (if more than 1 target or explicit batch mode)
-    if len(targets) > 1 or user_id_or_name == 'all':
+    if len(targets) > 1 or user_id_or_name.startswith('all'):
         print("\n" + "="*60)
         print(f"{'FINAL BATCH UPLOAD SUMMARY':^60}")
         print("="*60)
@@ -514,12 +566,14 @@ def upload_album(user_id_or_name, max_retries=3, local_check=False, block_size_m
         
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Upload images to a specified album.")
-    parser.add_argument("--user_id_or_name", default="all", type=str, help="User ID or Name, or comma-separated list. Use 'all' for users.json. (default: all)")
+    parser.add_argument("--user_id_or_name", default="all_douyin", type=str, help="User ID or Name, or comma-separated list. Use 'all_twitter' or 'all_douyin' for batch. (default: all_douyin)")
     parser.add_argument("--retries", type=int, default=3, help="Max retries for failed uploads (default: 3)")
     parser.add_argument("--local_check", default=True, type=lambda x: (str(x).lower() == 'true'), help="Enable local history verification to skip uploaded files")
     parser.add_argument("--block_size", type=float, default=4, help="Upload block size in MB (default: 4)")
     parser.add_argument("--threads", type=int, default=1, help="Number of upload threads (default: 1)")
+    parser.add_argument("--cookies_path", type=str, default='baiduphoto/cookies.json', help="Path to cookies.json (default: baiduphoto/cookies.json)")
+    parser.add_argument("--config_files", type=str, nargs='+', default=None, help="List of user config JSON files. If not provided, defaults to internal project paths.")
      
     args = parser.parse_args()
     
-    upload_album(args.user_id_or_name, args.retries, args.local_check, args.block_size, args.threads)
+    upload_album(args.user_id_or_name, args.retries, args.local_check, args.block_size, args.threads, args.cookies_path, args.config_files)
