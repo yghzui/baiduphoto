@@ -84,13 +84,15 @@ def get_history_filename(cookie_file):
     stem = os.path.splitext(base)[0]
     return f'local_upload_history_{stem}.json'
 
-def upload_folder_task(folder_path, album_name=None, cookie_file='cookies.json', max_retries=3, local_check=True, block_size_mb=4, num_threads=1):
+def upload_folder_task(folder_path, album_name=None, cookie_file='cookies.json', max_retries=3, local_check=True, block_size_mb=4, num_threads=1, only_upload=False):
     print(f"--- Starting upload task for folder: {folder_path} ---")
     
     # Calculate block size in bytes
     block_size = int(block_size_mb * 1024 * 1024)
     print(f"Upload block size: {block_size_mb} MB ({block_size} bytes)")
     print(f"Number of threads: {num_threads}")
+    if only_upload:
+        print("Mode: Only upload (Skip adding to album)")
     
     # 1. Validate folder
     if not os.path.exists(folder_path):
@@ -141,37 +143,43 @@ def upload_folder_task(folder_path, album_name=None, cookie_file='cookies.json',
         return
 
     # 4. Find or Create Album
-    print(f"Checking album existence: {album_name}...")
     target_album = None
-    try:
-        all_albums = api.get_self_All(typeName='Album')
-        for album in all_albums:
-            if album.getName() == album_name:
-                target_album = album
-                print(f"Found existing album: {album_name} (ID: {album.getID()})")
-                break
-        
-        if not target_album:
-            print(f"Album not found. Creating new album: {album_name}...")
-            target_album = api.createNewAlbum(Name=album_name)
-            print(f"Album created successfully: {album_name} (ID: {target_album.getID()})")
-    except Exception as e:
-        print(f"Error handling album creation: {e}")
-        return
+    if not only_upload:
+        print(f"Checking album existence: {album_name}...")
+        try:
+            all_albums = api.get_self_All(typeName='Album')
+            for album in all_albums:
+                if album.getName() == album_name:
+                    target_album = album
+                    print(f"Found existing album: {album_name} (ID: {album.getID()})")
+                    break
+            
+            if not target_album:
+                print(f"Album not found. Creating new album: {album_name}...")
+                target_album = api.createNewAlbum(Name=album_name)
+                print(f"Album created successfully: {album_name} (ID: {target_album.getID()})")
+        except Exception as e:
+            print(f"Error handling album creation: {e}")
+            return
+    else:
+        print("Skipping album creation/lookup as per --only_upload.")
 
     # 5. Get existing files in album for de-duplication
-    print("Fetching existing files in album to skip duplicates...")
     existing_names = set()
-    try:
-        # get_sub_All returns a list of OnlineItem
-        existing_items = target_album.get_sub_All()
-        if existing_items:
-            for item in existing_items:
-                existing_names.add(item.getName())
-        print(f"Found {len(existing_names)} existing files in album.")
-    except Exception as e:
-        print(f"Error fetching album content: {e}")
-        return
+    if not only_upload and target_album:
+        print("Fetching existing files in album to skip duplicates...")
+        try:
+            # get_sub_All returns a list of OnlineItem
+            existing_items = target_album.get_sub_All()
+            if existing_items:
+                for item in existing_items:
+                    existing_names.add(item.getName())
+            print(f"Found {len(existing_names)} existing files in album.")
+        except Exception as e:
+            print(f"Error fetching album content: {e}")
+            return
+    else:
+         print("Skipping album content check (only_upload mode or no album found).")
 
     # 6. Collect all files
     print(f"Scanning upload directory: {folder_path}")
@@ -460,6 +468,7 @@ if __name__ == '__main__':
     parser.add_argument("--local_check", default=True, type=lambda x: (str(x).lower() == 'true'), help="Enable local history verification to skip uploaded files")
     parser.add_argument("--block_size", type=float, default=10, help="Upload block size in MB (default: 20)")
     parser.add_argument("--threads", type=int, default=4, help="Number of upload threads (default: 3)")
+    parser.add_argument("--only_upload", action="store_true", help="Only upload files without adding to specified album.")
      
     args = parser.parse_args()
     
@@ -470,4 +479,4 @@ if __name__ == '__main__':
         print("Error: You must provide a folder path.")
         parser.print_help()
     else:
-        upload_folder_task(target_folder, args.album_name, args.cookie_file, args.retries, local_check, args.block_size, args.threads)
+        upload_folder_task(target_folder, args.album_name, args.cookie_file, args.retries, local_check, args.block_size, args.threads, only_upload=args.only_upload)
