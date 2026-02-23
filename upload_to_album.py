@@ -164,6 +164,27 @@ def upload_task(user_id_or_name, max_retries=3, local_check=False, block_size_mb
     print(f"Scanning upload directory: {upload_dir}")
     file_tasks = []
     
+    # 允许上传的文件扩展名 (图片, 视频, RAW, 其他)
+    # 常见图片: .jpg, .jpeg, .png, .bmp, .gif, .webp, .heic, .tif, .tiff
+    # 常见视频: .mp4, .mov, .avi, .mkv, .flv, .wmv, .m4v, .ts, .webm, .vob, .mts, .m2ts
+    # 常见RAW: .arw, .cr2, .cr3, .nef, .dng, .orf, .raf, .rw2, .sr2, .srf, .srw, .nrw, .k25, .kdc, .dcs, .dcr, .drf, .obm, .pef, .ptx, .pxn, .r3d, .rwl, .rwz, .x3f, .3fr, .ari, .bay, .crw, .cap, .data, .eip, .erf, .fff, .gpr, .iiq, .mdc, .mef, .mos, .mrw
+    # 其他: .lrf (DJI预览文件), .insv (Insta360全景)
+    VALID_EXTENSIONS = {
+        # 图片
+        '.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp', '.heic', '.tif', '.tiff',
+        # 视频
+        '.mp4', '.mov', '.avi', '.mkv', '.flv', '.wmv', '.m4v', '.ts', '.webm', '.vob', '.mts', '.m2ts',
+        # RAW 格式 (覆盖主流相机品牌)
+        '.arw', '.cr2', '.cr3', '.nef', '.dng', '.orf', '.raf', '.rw2', 
+        '.sr2', '.srf', '.srw', '.nrw', '.k25', '.kdc', '.dcs', '.dcr', 
+        '.drf', '.obm', '.pef', '.ptx', '.pxn', '.r3d', '.rwl', '.rwz', 
+        '.x3f', '.3fr', '.ari', '.bay', '.crw', '.cap', '.data', '.eip', 
+        '.erf', '.fff', '.gpr', '.iiq', '.mdc', '.mef', '.mos', '.mrw',
+        # 其他设备特定格式
+        '.lrf', # DJI 低分辨率预览
+        '.insv' # Insta360 全景视频
+    }
+
     for root, dirs, files in os.walk(upload_dir):
         for file in files:
             file_path = os.path.join(root, file)
@@ -175,6 +196,12 @@ def upload_task(user_id_or_name, max_retries=3, local_check=False, block_size_mb
                     print(f"  -> Warning: Failed to remove {file}: {e}")
                 continue
             
+            # 2. 检查文件扩展名是否在白名单中
+            ext = os.path.splitext(file)[1].lower()
+            if ext not in VALID_EXTENSIONS:
+                # print(f"  -> Skipped: {file} (Unsupported file type: {ext})")
+                continue
+
             file_tasks.append((root, file))
 
     # Sort files by size (ascending) - upload small files first
