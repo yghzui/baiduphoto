@@ -10,9 +10,15 @@ from concurrent.futures import ThreadPoolExecutor
 
 # Add current directory to path
 sys.path.append(os.getcwd())
+# Ensure current script directory is in path for local imports
+current_dir = os.path.dirname(os.path.abspath(__file__))
+if current_dir not in sys.path:
+    sys.path.append(current_dir)
 
 from pybaiduphoto import API
 from generate_upload_info import generate_upload_info
+from file_time_utils import try_fix_file_time
+
 current_dir = os.path.dirname(os.path.abspath(__file__))
 HISTORY_FILE = os.path.join(current_dir, 'local_upload_history.json')
 
@@ -328,6 +334,12 @@ def upload_task(user_id_or_name, max_retries=3, local_check=False, block_size_mb
                         fail_count += 1
                     printer.log(f"  -> Error creating temp file: {e}")
                     return
+
+            # Fix upload file time (mtime) to match shoot time
+            try:
+                try_fix_file_time(upload_path)
+            except Exception as e:
+                pass
 
             # Retry Loop
             success = False

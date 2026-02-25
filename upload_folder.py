@@ -10,8 +10,13 @@ from concurrent.futures import ThreadPoolExecutor
 
 # Add current directory to path
 sys.path.append(os.getcwd())
+# Ensure current script directory is in path for local imports
+current_dir = os.path.dirname(os.path.abspath(__file__))
+if current_dir not in sys.path:
+    sys.path.append(current_dir)
 
 from pybaiduphoto import API
+from file_time_utils import try_fix_file_time
 
 class MultiLinePrinter:
     def __init__(self, num_lines):
@@ -352,6 +357,13 @@ def upload_folder_task(folder_path, album_name=None, cookie_file='cookies.json',
                         fail_count += 1
                     printer.log(f"  -> Error creating temp file: {e}")
                     return
+
+            # Fix upload file time (mtime) to match shoot time
+            try:
+                try_fix_file_time(upload_path)
+            except Exception as e:
+                # Log error but don't stop upload
+                pass
 
             # Retry Loop
             success = False
