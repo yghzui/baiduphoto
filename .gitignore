@@ -5,3 +5,8 @@ test\.py
 
 \.DS_Store
 upload.py
+.idea/
+__pycache__/
+*.log
+*.json
+*.db
