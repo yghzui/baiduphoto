@@ -10,3 +10,5 @@ __pycache__/
 *.log
 *.json
 *.db
+upload_to_album_ui_wrapper.py
+upload_folder_ui_wrapper.py

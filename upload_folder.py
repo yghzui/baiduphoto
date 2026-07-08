@@ -81,6 +81,83 @@ def clean_filename(text):
     """
     return "".join(c for c in text if c <= "\uFFFF")
 
+def describe_api_error(data, action):
+    if not isinstance(data, dict):
+        return f"{action} failed: unexpected response type {type(data).__name__}"
+
+    errno = data.get("errno")
+    request_id = data.get("request_id")
+    errmsg = data.get("errmsg") or data.get("error_msg") or data.get("show_msg")
+    parts = [f"{action} failed", f"errno={errno}"]
+    if request_id:
+        parts.append(f"request_id={request_id}")
+    if errmsg:
+        parts.append(f"message={errmsg}")
+    return ", ".join(parts)
+
+def get_all_albums_checked(api):
+    albums = []
+    cursor = None
+    while True:
+        params = {
+            "need_amount": "1",
+            "need_member": "1",
+            "field": "mtime",
+        }
+        if cursor is not None:
+            params["cursor"] = cursor
+
+        data = api.req.getReqJson(
+            url="https://photo.baidu.com/youai/album/v1/list",
+            params=params,
+        )
+        if not isinstance(data, dict) or data.get("errno") != 0:
+            raise RuntimeError(describe_api_error(data, "Fetch album list"))
+        if "list" not in data:
+            raise RuntimeError(describe_api_error(data, "Fetch album list") + ", missing field=list")
+        if data["list"]:
+            albums.extend(api.getAlbum_ByInfo(info=info) for info in data["list"])
+        if data.get("has_more") != 1:
+            return albums
+        cursor = data.get("cursor")
+
+def create_album_checked(api, album_name):
+    data = api.g.createNewAlbum(album_name)
+    if not isinstance(data, dict) or data.get("errno") != 0:
+        raise RuntimeError(describe_api_error(data, "Create album"))
+    if "info" not in data:
+        raise RuntimeError(describe_api_error(data, "Create album") + ", missing field=info")
+    return api.getAlbum_ByInfo(info=data["info"])
+
+def get_album_existing_names_checked(api, album):
+    existing_names = set()
+    cursor = None
+    while True:
+        data = {
+            "cursor": cursor,
+            "album_id": album.getID(),
+        }
+        response = api.req.postReqJson(
+            url="https://photo.baidu.com/youai/album/v1/listfile",
+            data=data,
+        )
+        if not isinstance(response, dict) or response.get("errno") != 0:
+            raise RuntimeError(describe_api_error(response, "Fetch album content"))
+        if "list" not in response:
+            raise RuntimeError(describe_api_error(response, "Fetch album content") + ", missing field=list")
+        for item_info in response["list"] or []:
+            path = item_info.get("path") or item_info.get("server_filename") or ""
+            if path:
+                existing_names.add(path.split("/")[-1])
+        if response.get("has_more") != 1:
+            return existing_names
+        cursor = response.get("cursor")
+
+def is_append_success(append_result):
+    if not isinstance(append_result, dict):
+        return False
+    return append_result.get("errno") in (0, 50000)
+
 def get_history_filename(cookie_file):
     base = os.path.basename(cookie_file)
     if base == 'cookies.json':
@@ -152,7 +229,7 @@ def upload_folder_task(folder_path, album_name=None, cookie_file='cookies.json',
     if not only_upload:
         print(f"Checking album existence: {album_name}...")
         try:
-            all_albums = api.get_self_All(typeName='Album')
+            all_albums = get_all_albums_checked(api)
             for album in all_albums:
                 if album.getName() == album_name:
                     target_album = album
@@ -161,7 +238,7 @@ def upload_folder_task(folder_path, album_name=None, cookie_file='cookies.json',
             
             if not target_album:
                 print(f"Album not found. Creating new album: {album_name}...")
-                target_album = api.createNewAlbum(Name=album_name)
+                target_album = create_album_checked(api, album_name)
                 print(f"Album created successfully: {album_name} (ID: {target_album.getID()})")
         except Exception as e:
             print(f"Error handling album creation: {e}")
@@ -174,11 +251,7 @@ def upload_folder_task(folder_path, album_name=None, cookie_file='cookies.json',
     if not only_upload and target_album:
         print("Fetching existing files in album to skip duplicates...")
         try:
-            # get_sub_All returns a list of OnlineItem
-            existing_items = target_album.get_sub_All()
-            if existing_items:
-                for item in existing_items:
-                    existing_names.add(item.getName())
+            existing_names = get_album_existing_names_checked(api, target_album)
             print(f"Found {len(existing_names)} existing files in album.")
         except Exception as e:
             print(f"Error fetching album content: {e}")
@@ -239,6 +312,7 @@ def upload_folder_task(folder_path, album_name=None, cookie_file='cookies.json',
     print(f"Total files to process: {total_files}")
 
     upload_count = 0
+    album_add_count = 0
     skip_count = 0
     fail_count = 0
     processed_count = 0
@@ -265,7 +339,7 @@ def upload_folder_task(folder_path, album_name=None, cookie_file='cookies.json',
 
     # Worker Function
     def process_file(task_item):
-        nonlocal upload_count, skip_count, fail_count, processed_count
+        nonlocal upload_count, album_add_count, skip_count, fail_count, processed_count
         idx, root, file = task_item
         
         # Get a display slot
@@ -291,27 +365,26 @@ def upload_folder_task(folder_path, album_name=None, cookie_file='cookies.json',
             cleaned_name = clean_filename(file)
             
             # --- Check 1: Local History (if enabled) ---
-            should_skip = False
+            history_matched = False
+            already_in_target_album = False
             with lock:
-                 if local_check and cleaned_name in album_history:
-                     should_skip = True
+                history_matched = local_check and cleaned_name in album_history
+                already_in_target_album = cleaned_name in existing_names
             
-            if should_skip:
-                 with lock:
-                     skip_count += 1
-                 # Optional: Log skip if needed, but keeping it quiet for speed unless error
-                 # printer.log(f"[{current_progress}/{total_files}] [Skip-Local] {file}")
-                 printer.update(slot_id, f"[ID:{slot_id}] [{current_progress}/{total_files}] [Skip-Local] {file}")
-                 time.sleep(0.1) # Brief pause to show skip
-                 return
+            if history_matched and (only_upload or already_in_target_album):
+                with lock:
+                    skip_count += 1
+                # Optional: Log skip if needed, but keeping it quiet for speed unless error
+                # printer.log(f"[{current_progress}/{total_files}] [Skip-Local] {file}")
+                printer.update(slot_id, f"[ID:{slot_id}] [{current_progress}/{total_files}] [Skip-Local] {file}")
+                time.sleep(0.1) # Brief pause to show skip
+                return
+
+            if history_matched and not already_in_target_album:
+                printer.update(slot_id, f"[ID:{slot_id}] [{current_progress}/{total_files}] [Need-Album] {file}")
 
             # --- Check 2: Cloud Existing ---
-            should_skip_cloud = False
-            with lock:
-                if cleaned_name in existing_names:
-                    should_skip_cloud = True
-            
-            if should_skip_cloud:
+            if already_in_target_album:
                 with lock:
                     if local_check and cleaned_name not in album_history:
                          album_history[cleaned_name] = True
@@ -419,22 +492,25 @@ def upload_folder_task(folder_path, album_name=None, cookie_file='cookies.json',
                     
                     if ret:
                         is_existing = getattr(ret, 'is_existing', False)
+                        append_res = getattr(ret, 'append_result', None)
+                        album_ok = only_upload or is_append_success(append_res)
+                        if not album_ok:
+                            printer.log(f"[{current_progress}/{total_files}] [Album-Error] {file}: {append_res}")
+                            continue
+
                         with lock:
-                            if is_existing:
-                                # printer.log(f"  -> [Cloud Match] File exists in cloud (fs_id={ret.get_fsid()}).")
-                                pass # Keep log quiet
-                            
-                            append_res = getattr(ret, 'append_result', None)
-                            # Verify album addition
-                            
-                            existing_names.add(cleaned_name) 
+                            existing_names.add(cleaned_name)
                             if local_check:
                                 album_history[cleaned_name] = True
-                            
                             upload_count += 1
+                            if is_existing and not only_upload:
+                                album_add_count += 1
                         
                         success = True
-                        printer.log(f"[{current_progress}/{total_files}] [Success] 耗时:{get_elapsed_str()} {file}")
+                        if is_existing and not only_upload:
+                            printer.log(f"[{current_progress}/{total_files}] [Added-Existing] 耗时:{get_elapsed_str()} {file}")
+                        else:
+                            printer.log(f"[{current_progress}/{total_files}] [Success] 耗时:{get_elapsed_str()} {file}")
                         break
                     else:
                         printer.log(f"[{current_progress}/{total_files}] [Failed] {file} (API returned None)")
@@ -488,7 +564,9 @@ def upload_folder_task(folder_path, album_name=None, cookie_file='cookies.json',
 
     print("\n--- Task Summary ---")
     print(f"Total:    {total_files}")
-    print(f"Uploaded: {upload_count}")
+    print(f"Uploaded/Added: {upload_count}")
+    if not only_upload:
+        print(f"Added to album from existing cloud files: {album_add_count}")
     print(f"Skipped:  {skip_count}")
     print(f"Failed:   {fail_count}")
     
@@ -520,3 +598,10 @@ if __name__ == '__main__':
         parser.print_help()
     else:
         upload_folder_task(target_folder, args.album_name, args.cookie_file, args.retries, local_check, args.block_size, args.threads, only_upload=args.only_upload)
+
+
+
+
+
+
+
