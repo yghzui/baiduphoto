@@ -179,7 +179,7 @@ def upload_folder_task(folder_path, album_name=None, cookie_file='cookies.json',
     # 1. Validate folder
     if not os.path.exists(folder_path):
         print(f"Error: Upload directory does not exist: {folder_path}")
-        return
+        raise FileNotFoundError(f"Upload directory does not exist: {folder_path}")
 
     # 2. Determine Album Name
     if not album_name or album_name.lower() == 'none':
@@ -213,7 +213,7 @@ def upload_folder_task(folder_path, album_name=None, cookie_file='cookies.json',
 
     if not os.path.exists(cookie_path):
         print(f"Error: Cookie file not found at {cookie_path}")
-        return
+        raise FileNotFoundError(f"Cookie file not found at {cookie_path}")
         
     try:
         with open(cookie_path, 'r', encoding='utf-8') as f:
@@ -222,7 +222,7 @@ def upload_folder_task(folder_path, album_name=None, cookie_file='cookies.json',
         print(f"API initialized successfully using {cookie_file}.")
     except Exception as e:
         print(f"Login failed: {e}")
-        return
+        raise RuntimeError(f"Login failed: {e}") from e
 
     # 4. Find or Create Album
     target_album = None
@@ -242,7 +242,7 @@ def upload_folder_task(folder_path, album_name=None, cookie_file='cookies.json',
                 print(f"Album created successfully: {album_name} (ID: {target_album.getID()})")
         except Exception as e:
             print(f"Error handling album creation: {e}")
-            return
+            raise RuntimeError(f"Error handling album creation: {e}") from e
     else:
         print("Skipping album creation/lookup as per --only_upload.")
 
@@ -255,7 +255,7 @@ def upload_folder_task(folder_path, album_name=None, cookie_file='cookies.json',
             print(f"Found {len(existing_names)} existing files in album.")
         except Exception as e:
             print(f"Error fetching album content: {e}")
-            return
+            raise RuntimeError(f"Error fetching album content: {e}") from e
     else:
          print("Skipping album content check (only_upload mode or no album found).")
 
@@ -553,7 +553,8 @@ def upload_folder_task(folder_path, album_name=None, cookie_file='cookies.json',
             tasks = []
             for idx, (root, file) in enumerate(file_tasks):
                 tasks.append((idx, root, file))
-            executor.map(process_file, tasks)
+            for _ in executor.map(process_file, tasks):
+                pass
     
     # Final Save
     
