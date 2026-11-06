@@ -18,6 +18,7 @@ if current_dir not in sys.path:
 from pybaiduphoto import API
 from generate_upload_info import generate_upload_info
 from file_time_utils import try_fix_file_time
+from upload_folder import create_upload_progress_callback
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 HISTORY_FILE = os.path.join(current_dir, 'local_upload_history.json')
@@ -349,46 +350,7 @@ def upload_task(user_id_or_name, max_retries=3, local_check=False, block_size_mb
                     time.sleep(2)
                 
                 # Progress Callback Factory
-                def create_progress_callback(filename, my_slot):
-                    start_time = time.time()
-                    last_print_time = 0
-                    
-                    def callback(uploaded_size, total_size):
-                        nonlocal last_print_time
-                        current_time = time.time()
-                        
-                        # Update every 0.5 second or if finished
-                        if current_time - last_print_time >= 0.5 or uploaded_size >= total_size:
-                            elapsed_seconds = current_time - start_time
-                            elapsed = int(elapsed_seconds)
-                            hours, remainder = divmod(elapsed, 3600)
-                            minutes, seconds = divmod(remainder, 60)
-                            time_str = f"{hours:02}:{minutes:02}:{seconds:02}"
-                            
-                            uploaded_mb = uploaded_size / (1024 * 1024)
-                            total_mb = total_size / (1024 * 1024)
-                            
-                            percent = (uploaded_size / total_size) * 100 if total_size > 0 else 0
-                            speed = uploaded_mb / elapsed_seconds if elapsed_seconds > 0.1 else 0
-                            
-                            # Calculate ETA
-                            remaining_mb = total_mb - uploaded_mb
-                            if speed > 0:
-                                eta_seconds = int(remaining_mb / speed)
-                                eta_h, eta_r = divmod(eta_seconds, 3600)
-                                eta_m, eta_s = divmod(eta_r, 60)
-                                eta_str = f"{eta_h:02}:{eta_m:02}:{eta_s:02}"
-                            else:
-                                eta_str = "--:--:--"
-
-                            # [ID:X] [N/Total] [Upload] 12.5/100.0(MB) 12.5% 耗时00:00:12 1.50MB/s 剩余00:00:05 filename
-                            msg = f"[ID:{my_slot}] [{current_progress}/{total_files}] [Upload] {uploaded_mb:.2f}/{total_mb:.2f}(MB) {percent:.1f}% 耗时{time_str} {speed:.2f}MB/s 剩余{eta_str} {filename}"
-                            printer.update(my_slot, msg)
-                                
-                            last_print_time = current_time
-                    return callback
-                
-                progress_cb = create_progress_callback(file, slot_id)
+                progress_cb = create_upload_progress_callback(printer, file, slot_id, current_progress, total_files)
 
                 try:
                     # upload_1file handles uploading and appending to album
