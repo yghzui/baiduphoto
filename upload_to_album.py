@@ -446,8 +446,8 @@ def upload_album(user_id_or_name, max_retries=3, local_check=False, block_size_m
     else:
         current_dir = os.path.dirname(os.path.abspath(__file__))
         project_root = os.path.dirname(current_dir)
-        douyin_config = os.path.join(project_root, 'video_download_video_image', 'config', 'users.json')
-        twitter_config = os.path.join(project_root, 'video_download_video_image', 'config', 'x_user.json')
+        douyin_config = os.path.join(project_root, 'ui_function', 'media_download', 'config', 'users.json')
+        twitter_config = os.path.join(project_root, 'ui_function', 'media_download', 'config', 'x_user.json')
         all_configs = [
             (douyin_config, "Douyin"),
             (twitter_config, "Twitter")

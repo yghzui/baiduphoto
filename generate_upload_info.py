@@ -21,8 +21,8 @@ def generate_upload_info(query_id_or_name, config_files=None):
     else:
         current_dir = os.path.dirname(os.path.abspath(__file__))
         project_root = os.path.dirname(current_dir)
-        douyin_config = os.path.join(project_root, 'video_download_video_image', 'config', 'users.json')
-        twitter_config = os.path.join(project_root, 'video_download_video_image', 'config', 'x_user.json')
+        douyin_config = os.path.join(project_root, 'ui_function', 'media_download', 'config', 'users.json')
+        twitter_config = os.path.join(project_root, 'ui_function', 'media_download', 'config', 'x_user.json')
         config_paths = [douyin_config, twitter_config]
 
     users = []
