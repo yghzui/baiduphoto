@@ -20,9 +20,10 @@ def generate_upload_info(query_id_or_name, config_files=None):
         config_paths = config_files
     else:
         current_dir = os.path.dirname(os.path.abspath(__file__))
-        project_root = os.path.dirname(current_dir)
-        douyin_config = os.path.join(project_root, 'ui_function', 'media_download', 'config', 'users.json')
-        twitter_config = os.path.join(project_root, 'ui_function', 'media_download', 'config', 'x_user.json')
+        project_root = os.path.dirname(os.path.dirname(current_dir))
+        media_download_config_dir = os.path.join(project_root, 'runtime', 'config', 'media_download')
+        douyin_config = os.path.join(media_download_config_dir, 'users.json')
+        twitter_config = os.path.join(media_download_config_dir, 'x_user.json')
         config_paths = [douyin_config, twitter_config]
 
     users = []

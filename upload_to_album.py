@@ -445,9 +445,10 @@ def upload_album(user_id_or_name, max_retries=3, local_check=False, block_size_m
         all_configs = [(path, f"Custom Config {i+1}") for i, path in enumerate(config_files)]
     else:
         current_dir = os.path.dirname(os.path.abspath(__file__))
-        project_root = os.path.dirname(current_dir)
-        douyin_config = os.path.join(project_root, 'ui_function', 'media_download', 'config', 'users.json')
-        twitter_config = os.path.join(project_root, 'ui_function', 'media_download', 'config', 'x_user.json')
+        project_root = os.path.dirname(os.path.dirname(current_dir))
+        media_download_config_dir = os.path.join(project_root, 'runtime', 'config', 'media_download')
+        douyin_config = os.path.join(media_download_config_dir, 'users.json')
+        twitter_config = os.path.join(media_download_config_dir, 'x_user.json')
         all_configs = [
             (douyin_config, "Douyin"),
             (twitter_config, "Twitter")
